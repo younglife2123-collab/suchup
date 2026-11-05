@@ -98,6 +98,18 @@ header{position:sticky;top:0;z-index:20;background:var(--paper);padding-top:env(
 .item small{grid-column:1/-1;font-size:12.5px;color:var(--muted)}
 .item small[data-warn]{color:var(--sun)}
 .empty{color:var(--muted);padding:20px 12px;font-size:14px;text-wrap:balance}
+.item{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+.menu{position:fixed;z-index:40;min-width:180px;background:var(--sheet);border:1px solid var(--rule);border-radius:12px;padding:6px;box-shadow:0 12px 32px -12px rgba(20,40,30,.35)}
+.menu button{display:flex;align-items:center;gap:10px;width:100%;border:0;background:none;padding:9px 10px;border-radius:8px;text-align:left;font-size:14px;font-weight:500}
+.menu button:hover,.menu button:focus-visible{background:var(--accent-soft)}
+.menu .danger{color:var(--danger)}
+.menu svg{width:18px;height:18px}
+.menu hr{border:0;border-top:1px solid var(--rule);margin:4px 2px}
+.menu .label{font-size:12px;color:var(--muted);padding:6px 10px 2px}
+.toast{position:fixed;z-index:41;left:50%;transform:translateX(-50%);bottom:calc(24px + env(safe-area-inset-bottom,0px));display:flex;align-items:center;gap:14px;background:var(--ink);color:var(--paper);border-radius:12px;padding:10px 10px 10px 16px;font-size:14px;max-width:calc(100vw - 32px);box-shadow:0 10px 30px -10px rgba(0,0,0,.4)}
+.toast span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.toast button{border:0;background:none;color:var(--accent-soft);font-weight:700;padding:4px 8px;border-radius:8px;flex:none}
+@media (max-width:760px){.toast{bottom:calc(var(--nav) + 16px + env(safe-area-inset-bottom,0px))}}
 
 .editor{display:flex;flex-direction:column;min-height:0;min-width:0;padding:14px max(24px,env(safe-area-inset-right,0px)) 24px 24px}
 .ed-head{display:flex;gap:6px;align-items:center;min-height:38px;margin-bottom:10px;max-width:820px;width:100%;margin-inline:auto}
@@ -227,8 +239,6 @@ body.logged-out .bottom{display:none}
         <span class="meta" id="meta"></span>
         <span class="spacer"></span>
         <select class="kind-select" id="kind" aria-label="노트 종류" hidden></select>
-        <button class="btn danger" id="del" hidden>삭제</button>
-        <button class="btn primary" id="save" hidden disabled>저장</button>
       </div>
       <div class="placeholder" id="ph">왼쪽에서 노트를 고르거나 새 노트를 만드세요.</div>
       <div class="sheet" id="sheet" hidden>
@@ -262,6 +272,8 @@ body.logged-out .bottom{display:none}
   </section>
 </main>
 
+<div class="menu" id="menu" role="menu" hidden></div>
+<div class="toast" id="toast" role="status" hidden><span id="toast-msg"></span><button id="toast-undo">되돌리기</button></div>
 <button class="fab" id="fab" aria-label="새 노트"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
 <nav class="bottom" role="tablist">
   <button data-tab="notes" role="tab" aria-selected="true"><svg viewBox="0 0 24 24"><path d="M6 3h9l3 3v15H6z"/><path d="M9 11h6M9 15h6"/></svg>노트</button>
@@ -439,17 +451,17 @@ function renderNotes() {
     const sub = n.unsaved ? el('small', { 'data-warn': '' }, '저장 실패 · 열어서 다시 저장하세요') : (filter === 'all' && kindName(n.folder)) ? el('small', {}, kindName(n.folder)) : null;
     const b = el('button', { class: 'item', 'aria-current': String(!!cur && cur.note === n) }, el('b', {}, n.title || '제목 없음'), el('time', {}, dayLabel(n.date)), sub);
     b.onclick = () => openNote(n);
+    b.oncontextmenu = e => { e.preventDefault(); openMenu(n, e.clientX, e.clientY); }; // right-click on PC, long-press on Android
     box.append(b);
   }
 }
 function renderEditor() {
   const on = !!cur, n = on && cur.note;
   $('#sheet').hidden = !on; $('#ph').hidden = on;
-  $('#del').hidden = !on; $('#save').hidden = !on; $('#kind').hidden = !on || !kinds.length;
-  $('#save').disabled = !dirty();
+  $('#kind').hidden = !on || !kinds.length;
   const m = $('#meta');
-  m.textContent = !on ? '' : n.unsaved ? '저장 실패' : dirty() ? '저장 안 됨' : n.pending ? '저장하는 중' : n.id ? '저장됨' : '새 노트';
-  m.toggleAttribute('data-warn', on && (dirty() || !!n.unsaved));
+  m.textContent = !on ? '' : n.unsaved ? '저장 실패, 곧 다시 시도해요' : (dirty() || n.pending) ? '저장 중…' : n.id ? '저장됨' : '새 노트';
+  m.toggleAttribute('data-warn', on && !!n.unsaved);
   if (on) {
     $('#dateline').textContent = longDate(n.date);
     const sel = $('#kind'); sel.replaceChildren(el('option', { value: NOTES }, '종류 없음'), ...kinds.map(k => el('option', { value: k.id }, k.name)));
@@ -498,65 +510,108 @@ function newNote() {
   document.body.classList.add('editing');
   show(n, '', ''); tEl.focus();
 }
-// Optimistic save: the screen updates at once, Drive catches up in the background.
+// Autosave: 1.2 s after typing stops (and right away when leaving the note or the app).
+// The screen updates at once; Drive catches up in the background, one write at a time.
+let autoT = null;
+function scheduleSave() { clearTimeout(autoT); autoT = setTimeout(saveNote, 1200); renderEditor(); }
 function saveNote() {
+  clearTimeout(autoT);
   if (!dirty()) return;
-  if (!tEl.value.trim() && !bEl.value.trim()) { status('빈 노트는 저장하지 않아요.', 'warn'); return; }
-  const n = cur.note;
-  const title = clean(tEl.value).slice(0, 80) || clean(bEl.value.split('\n').find(l => l.trim()) || '').slice(0, 40) || '제목 없음';
-  const body = bEl.value, text = `# ${title}\n\n${body}`;
+  if (!tEl.value.trim() && !bEl.value.trim()) return; // empty new note: nothing to keep
+  const n = cur.note, raw = { t: tEl.value, b: bEl.value };
+  const title = clean(raw.t).slice(0, 80) || clean(raw.b.split('\n').find(l => l.trim()) || '').slice(0, 40) || '제목 없음';
+  const text = `# ${title}\n\n${raw.b}`;
   const before = { t: cur.t, b: cur.b };
-  tEl.value = title; cur.t = title; cur.b = body;
+  cur.t = raw.t; cur.b = raw.b; // the inputs are never rewritten while the user types
   Object.assign(n, { title, text, pending: true, unsaved: null, modifiedTime: new Date().toISOString() });
   notes = [n, ...notes.filter(x => x !== n)];
   renderNotes(); renderEditor();
   queue(async () => {
+    if (!notes.includes(n)) return; // deleted before this write ran
     try {
       const f = n.id ? await updateFile(n.id, fileName(n), text) : await createFile(n.folder, fileName(n), text);
-      n.id = f.id; n.modifiedTime = f.modifiedTime; n.pending = false;
-      if (n.text === text) cache.set(n.id, { text, m: f.modifiedTime });
+      n.id = f.id; n.modifiedTime = f.modifiedTime;
+      if (n.text === text) { n.pending = false; cache.set(n.id, { text, m: f.modifiedTime }); }
     } catch (e) {
-      Object.assign(n, { pending: false, unsaved: { t: title, b: body }, savedT: before.t, savedB: before.b });
-      if (cur && cur.note === n && !dirty()) { cur.t = before.t; cur.b = before.b; }
+      Object.assign(n, { pending: false, unsaved: { t: raw.t, b: raw.b }, savedT: before.t, savedB: before.b });
+      if (cur && cur.note === n) { cur.t = before.t; cur.b = before.b; setTimeout(() => { if (token && cur && cur.note === n) saveNote(); }, 5000); }
       fail(e);
     }
     renderNotes(); renderEditor();
   });
 }
-function deleteNote() {
-  if (!cur) return;
-  const n = cur.note;
-  cur = null; document.body.classList.remove('editing');
-  notes = notes.filter(x => x !== n);
-  renderNotes(); renderEditor();
+
+/* right-click (PC) / long-press (phone) menu on a note */
+let menuNote = null;
+function closeMenu() { $('#menu').hidden = true; menuNote = null; }
+function openMenu(n, x, y) {
+  menuNote = n;
+  const m = $('#menu'); m.replaceChildren();
+  const item = (label, fn, cls) => { const b = el('button', { role: 'menuitem', class: cls || '' }, label); b.onclick = () => { closeMenu(); fn(); }; return b; };
+  m.append(item('열기', () => openNote(n)));
+  if (kinds.length) {
+    m.append(el('hr'), el('div', { class: 'label' }, '종류 옮기기'));
+    for (const k of [{ id: NOTES, name: '종류 없음' }, ...kinds]) if (k.id !== n.folder) m.append(item(k.name, () => moveNote(n, k.id)));
+  }
+  m.append(el('hr'), item('휴지통으로 옮기기', () => removeNote(n), 'danger'));
+  m.hidden = false;
+  const r = m.getBoundingClientRect();
+  m.style.left = Math.min(x, innerWidth - r.width - 8) + 'px';
+  m.style.top = Math.min(y, innerHeight - r.height - 8) + 'px';
+  m.querySelector('button').focus();
+}
+document.addEventListener('pointerdown', e => { if (!$('#menu').hidden && !$('#menu').contains(e.target)) closeMenu(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeMenu(); });
+window.addEventListener('blur', closeMenu);
+$('#items').addEventListener('scroll', closeMenu);
+
+/* delete with a 5-second undo; the Drive trash happens when the toast goes away */
+let pendingDel = null, toastT = null;
+function commitDelete() {
+  if (!pendingDel) return;
+  const n = pendingDel; pendingDel = null; clearTimeout(toastT); $('#toast').hidden = true;
   if (!n.id && !n.pending) return;
   queue(async () => {
-    try { if (n.id) { await trash(n.id); cache.del(n.id); } status('드라이브 휴지통으로 옮겼어요.'); }
+    try { if (n.id) { await trash(n.id); cache.del(n.id); } }
     catch (e) { notes.unshift(n); renderNotes(); fail(e); }
   });
 }
-$('#kind').onchange = e => {
-  if (!cur) return;
-  const n = cur.note, from = n.folder, to = e.target.value;
+function removeNote(n) {
+  commitDelete(); // an earlier delete still waiting on its undo goes through now
+  if (cur && cur.note === n) { clearTimeout(autoT); cur = null; document.body.classList.remove('editing'); }
+  notes = notes.filter(x => x !== n);
+  renderNotes(); renderEditor();
+  pendingDel = n;
+  $('#toast-msg').textContent = `‘${n.title || '제목 없음'}’을 휴지통으로 옮겼어요.`;
+  $('#toast').hidden = false;
+  toastT = setTimeout(commitDelete, 5000);
+}
+$('#toast-undo').onclick = () => {
+  const n = pendingDel; if (!n) return;
+  pendingDel = null; clearTimeout(toastT); $('#toast').hidden = true;
+  notes = [...notes, n].sort((a, b) => (b.modifiedTime || '').localeCompare(a.modifiedTime || ''));
+  renderNotes();
+};
+function moveNote(n, to) {
+  const from = n.folder;
   if (from === to) return;
-  n.folder = to; renderNotes();
+  n.folder = to; renderNotes(); renderEditor();
   if (!n.id && !n.pending) return; // not on Drive yet: the first save puts it in the right folder
   queue(async () => {
     try { await moveFile(n.id, from, to); }
     catch (err) { n.folder = from; renderNotes(); renderEditor(); fail(err); }
   });
-};
-tEl.addEventListener('input', renderEditor);
-bEl.addEventListener('input', renderEditor);
+}
+$('#kind').onchange = e => { if (cur) moveNote(cur.note, e.target.value); };
+tEl.addEventListener('input', scheduleSave);
+bEl.addEventListener('input', scheduleSave);
 tEl.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); bEl.focus(); } });
 $('#q').addEventListener('input', renderNotes);
 $('#new').onclick = newNote;
 $('#fab').onclick = newNote;
-$('#save').onclick = saveNote;
-$('#del').onclick = e => armDelete(e.currentTarget, '삭제', deleteNote);
-$('#back').onclick = () => { if (dirty()) saveNote(); document.body.classList.remove('editing'); };
+$('#back').onclick = () => { saveNote(); document.body.classList.remove('editing'); };
 document.addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); saveNote(); } });
-window.addEventListener('beforeunload', e => { if (dirty() || notes.some(n => n.pending)) e.preventDefault(); });
+window.addEventListener('beforeunload', e => { saveNote(); commitDelete(); if (notes.some(n => n.pending)) e.preventDefault(); });
 
 /* ---------- calendar ---------- */
 // one file per event: "YYYY-MM-DD[ HH:MM] 내용.md"
@@ -638,7 +693,7 @@ window.addEventListener('hashchange', () => showTab(location.hash.slice(1)));
 let syncing = false;
 async function syncAll() {
   if (!token || syncing) return;
-  if (dirty()) saveNote();
+  saveNote(); commitDelete();
   syncing = true; $('#refresh').disabled = true; $('#refresh').classList.add('spin'); status('');
   try {
     await chain; // let pending writes land before re-reading
@@ -649,7 +704,10 @@ async function syncAll() {
 }
 $('#refresh').onclick = syncAll;
 // pick up changes made on the other device (or by Claude) when the app comes back to the front
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && !dirty()) syncAll(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') { saveNote(); commitDelete(); } // phone switched apps: write now
+  else if (!dirty()) syncAll();
+});
 
 renderCal();
 token = loadToken();
