@@ -386,11 +386,17 @@ function armDelete(btn, label, run) {
 /* ---------- notes ---------- */
 // Drive layout: 노트/<종류>/YYYY-MM-DD 제목.md   (종류 = subfolder; none = directly in 노트/)
 // File content: "# 제목\n\n본문". Date in the name is the day the note was written and never changes.
-let kinds = [], filter = 'all', notes = [], cur = null; // cur: {note, t, b} where t/b = last saved title/body
+// Every keystroke is recorded at once (memory + this device's storage); Drive is updated right behind it.
+// note: {id, title, date, folder, modifiedTime, raw:{t,b} latest editor text, text: latest file content,
+//        synced: content last written to Drive, pending: a Drive write is queued, failed, tmp: device-draft key}
+let kinds = [], filter = 'all', notes = [], cur = null; // cur: {note}
 let chain = Promise.resolve(); // drive writes run one at a time, in order
 const queue = job => (chain = chain.then(job, job));
 const tEl = $('#title'), bEl = $('#body');
-const dirty = () => !!cur && (tEl.value !== cur.t || bEl.value !== cur.b);
+const needsSync = n => n.text != null && n.text !== n.synced;
+const draftKey = n => 'd:' + (n.tmp || (n.tmp = 't' + Date.now() + Math.random().toString(36).slice(2, 6)));
+function saveDraft(n) { try { localStorage.setItem(draftKey(n), JSON.stringify({ id: n.id, date: n.date, folder: n.folder, t: n.raw.t, b: n.raw.b })); } catch {} }
+function dropDraft(n) { try { if (n.tmp) localStorage.removeItem('d:' + n.tmp); } catch {} }
 const cache = {
   get(id) { try { return JSON.parse(localStorage.getItem('n:' + id)); } catch { return null; } },
   set(id, v) { try { localStorage.setItem('n:' + id, JSON.stringify(v)); } catch {} },
@@ -448,7 +454,7 @@ function renderNotes() {
   const shown = notes.filter(n => (filter === 'all' || n.folder === filter) && (!q || n.title.toLowerCase().includes(q)));
   if (!shown.length) box.append(el('div', { class: 'empty' }, q ? '찾는 제목의 노트가 없어요.' : filter === 'all' ? '아직 노트가 없어요. 새 노트로 첫 장을 채워 보세요.' : '이 종류에는 아직 노트가 없어요.'));
   for (const n of shown) {
-    const sub = n.unsaved ? el('small', { 'data-warn': '' }, '저장 실패 · 열어서 다시 저장하세요') : (filter === 'all' && kindName(n.folder)) ? el('small', {}, kindName(n.folder)) : null;
+    const sub = n.failed ? el('small', { 'data-warn': '' }, '기기에만 저장됨, 드라이브 연결을 기다리는 중') : (filter === 'all' && kindName(n.folder)) ? el('small', {}, kindName(n.folder)) : null;
     const b = el('button', { class: 'item', 'aria-current': String(!!cur && cur.note === n) }, el('b', {}, n.title || '제목 없음'), el('time', {}, dayLabel(n.date)), sub);
     b.onclick = () => openNote(n);
     b.oncontextmenu = e => { e.preventDefault(); openMenu(n, e.clientX, e.clientY); }; // right-click on PC, long-press on Android
@@ -460,8 +466,8 @@ function renderEditor() {
   $('#sheet').hidden = !on; $('#ph').hidden = on;
   $('#kind').hidden = !on || !kinds.length;
   const m = $('#meta');
-  m.textContent = !on ? '' : n.unsaved ? '저장 실패, 곧 다시 시도해요' : (dirty() || n.pending) ? '저장 중…' : n.id ? '저장됨' : '새 노트';
-  m.toggleAttribute('data-warn', on && !!n.unsaved);
+  m.textContent = !on ? '' : (!n.id && n.text == null) ? '새 노트' : n.failed ? '기기에 저장됨, 드라이브 연결을 기다리는 중' : needsSync(n) ? '저장됨, 드라이브에 올리는 중' : '저장됨';
+  m.toggleAttribute('data-warn', on && !!n.failed);
   if (on) {
     $('#dateline').textContent = longDate(n.date);
     const sel = $('#kind'); sel.replaceChildren(el('option', { value: NOTES }, '종류 없음'), ...kinds.map(k => el('option', { value: k.id }, k.name)));
@@ -474,68 +480,84 @@ async function loadNotes() {
   if (filter !== 'all' && !kinds.some(k => k.id === filter)) filter = 'all';
   const parents = [NOTES, ...kinds.map(k => k.id)].map(id => `'${id}' in parents`).join(' or ');
   const files = await list(`(${parents}) and mimeType != '${FOLDER}' and trashed = false`, 'modifiedTime desc', 'files(id,name,parents,createdTime,modifiedTime),nextPageToken');
-  const keep = notes.filter(n => n.unsaved); // failed saves stay until the user retries
+  const keep = notes.filter(needsSync); // edits not on Drive yet win over the Drive copy
   notes = [...keep, ...files.filter(f => /\.md$/i.test(f.name) && !keep.some(k => k.id === f.id)).map(parseNote)];
-  if (cur && cur.note.id) { const m = notes.find(x => x.id === cur.note.id); if (m) { m.text = cur.note.text; cur.note = m; } }
+  if (cur && cur.note.id) notes = notes.map(x => x.id === cur.note.id && x !== cur.note ? Object.assign(cur.note, { folder: x.folder, title: x.title, modifiedTime: x.modifiedTime }) : x);
   renderKinds(); renderNotes(); renderEditor();
 }
-function show(n, t, b) { tEl.value = t; bEl.value = b; bEl.scrollTop = 0; renderNotes(); renderEditor(); }
+// after the app was closed mid-typing: put device drafts back and send them to Drive
+function restoreDrafts() {
+  let keys = []; try { keys = Object.keys(localStorage).filter(k => k.startsWith('d:')); } catch {}
+  for (const k of keys) {
+    let d; try { d = JSON.parse(localStorage.getItem(k)); } catch { continue; }
+    if (!d) continue;
+    let n = d.id && notes.find(x => x.id === d.id);
+    if (!n) { n = { id: d.id || null, date: d.date, folder: d.folder || NOTES }; notes.unshift(n); }
+    n.tmp = k.slice(2); n.raw = { t: d.t, b: d.b }; record(n);
+  }
+  if (keys.length) { renderNotes(); flush(); }
+}
+function show(t, b) { tEl.value = t; bEl.value = b; bEl.scrollTop = 0; renderNotes(); renderEditor(); }
 async function openNote(n) {
-  if (dirty()) saveNote();
+  flush();
+  cur = { note: n };
   document.body.classList.add('editing');
-  if (n.unsaved) { cur = { note: n, t: n.savedT ?? '', b: n.savedB ?? '' }; return show(n, n.unsaved.t, n.unsaved.b); }
-  const known = n.text ?? (n.id && cache.get(n.id));
-  const fresh = typeof known === 'string' || (known && known.m === n.modifiedTime);
-  const text = typeof known === 'string' ? known : known && known.text;
-  if (text != null) { const s = splitNote(text); cur = { note: n, t: s.t, b: s.b }; show(n, s.t, s.b); }
+  if (n.raw) return show(n.raw.t, n.raw.b);
+  const known = n.text != null ? { text: n.text, m: n.modifiedTime } : n.id && cache.get(n.id);
+  const fresh = !!known && known.m === n.modifiedTime;
+  if (known) { const s = splitNote(known.text); n.raw = s; if (fresh) n.text = n.synced = known.text; show(s.t, s.b); }
   if (fresh || !n.id) return;
-  // no copy, or an older one: fetch, and swap in if the user hasn't started typing
-  const loading = text == null;
-  if (loading) { cur = { note: n, t: n.title, b: '' }; show(n, n.title, ''); tEl.disabled = bEl.disabled = true; }
+  // no copy here, or an older one: fetch it, and swap it in unless the user has started typing
+  if (!known) { show(n.title, ''); tEl.disabled = bEl.disabled = true; }
   try {
     const t = await readText(n.id);
     cache.set(n.id, { text: t, m: n.modifiedTime });
-    if (cur && cur.note === n && !dirty()) { const s = splitNote(t); cur.t = s.t; cur.b = s.b; show(n, s.t, s.b); }
+    if (cur && cur.note === n && !needsSync(n)) { const s = splitNote(t); n.raw = s; n.text = n.synced = t; show(s.t, s.b); }
   } catch (e) {
-    // never leave an empty sheet open that a save could write over the real note with
-    if (loading && cur && cur.note === n) { cur = null; document.body.classList.remove('editing'); renderNotes(); renderEditor(); }
+    // never leave an empty sheet open that typing could write over the real note with
+    if (!known && cur && cur.note === n) { cur = null; document.body.classList.remove('editing'); renderNotes(); renderEditor(); }
     fail(e);
   }
   tEl.disabled = bEl.disabled = false;
 }
 function newNote() {
-  if (dirty()) saveNote();
-  const n = { id: null, title: '', date: ymd(new Date()), folder: filter === 'all' ? NOTES : filter, modifiedTime: new Date().toISOString() };
-  cur = { note: n, t: '', b: '' };
+  flush();
+  cur = { note: { id: null, title: '', date: ymd(new Date()), folder: filter === 'all' ? NOTES : filter } };
   document.body.classList.add('editing');
-  show(n, '', ''); tEl.focus();
+  show('', ''); tEl.focus();
 }
-// Autosave: 1.2 s after typing stops (and right away when leaving the note or the app).
-// The screen updates at once; Drive catches up in the background, one write at a time.
-let autoT = null;
-function scheduleSave() { clearTimeout(autoT); autoT = setTimeout(saveNote, 1200); renderEditor(); }
-function saveNote() {
-  clearTimeout(autoT);
-  if (!dirty()) return;
-  if (!tEl.value.trim() && !bEl.value.trim()) return; // empty new note: nothing to keep
-  const n = cur.note, raw = { t: tEl.value, b: bEl.value };
-  const title = clean(raw.t).slice(0, 80) || clean(raw.b.split('\n').find(l => l.trim()) || '').slice(0, 40) || '제목 없음';
-  const text = `# ${title}\n\n${raw.b}`;
-  const before = { t: cur.t, b: cur.b };
-  cur.t = raw.t; cur.b = raw.b; // the inputs are never rewritten while the user types
-  Object.assign(n, { title, text, pending: true, unsaved: null, modifiedTime: new Date().toISOString() });
-  notes = [n, ...notes.filter(x => x !== n)];
-  renderNotes(); renderEditor();
+function record(n) {
+  const { t, b } = n.raw;
+  n.title = clean(t).slice(0, 80) || clean(b.split('\n').find(l => l.trim()) || '').slice(0, 40) || '제목 없음';
+  n.text = `# ${n.title}\n\n${b}`;
+  n.modifiedTime = new Date().toISOString();
+  saveDraft(n);
+  if (notes[0] !== n) notes = [n, ...notes.filter(x => x !== n)];
+}
+let syncT = null;
+function onType() {
+  if (!cur) return;
+  const n = cur.note;
+  n.raw = { t: tEl.value, b: bEl.value }; // the inputs themselves are never rewritten while typing
+  if (!n.id && n.text == null && !n.raw.t.trim() && !n.raw.b.trim()) return; // untouched new note
+  record(n); renderNotes(); renderEditor();
+  if (!syncT) syncT = setTimeout(flush, 700); // at most one Drive write per 0.7 s while typing
+}
+function flush() { clearTimeout(syncT); syncT = null; for (const n of notes) if (needsSync(n) && !n.pending) sync(n); }
+function sync(n) {
+  n.pending = true;
   queue(async () => {
-    if (!notes.includes(n)) return; // deleted before this write ran
+    n.pending = false;
+    if (!notes.includes(n) || !needsSync(n)) return; // deleted, or an earlier write already carried this text
+    const text = n.text;
     try {
       const f = n.id ? await updateFile(n.id, fileName(n), text) : await createFile(n.folder, fileName(n), text);
-      n.id = f.id; n.modifiedTime = f.modifiedTime;
-      if (n.text === text) { n.pending = false; cache.set(n.id, { text, m: f.modifiedTime }); }
+      n.id = f.id; n.synced = text; n.failed = false;
+      if (n.text === text) { n.modifiedTime = f.modifiedTime; cache.set(n.id, { text, m: f.modifiedTime }); dropDraft(n); }
+      else saveDraft(n); // newer typing is waiting; keep its draft, now with the file id
     } catch (e) {
-      Object.assign(n, { pending: false, unsaved: { t: raw.t, b: raw.b }, savedT: before.t, savedB: before.b });
-      if (cur && cur.note === n) { cur.t = before.t; cur.b = before.b; setTimeout(() => { if (token && cur && cur.note === n) saveNote(); }, 5000); }
-      fail(e);
+      n.failed = true; fail(e);
+      setTimeout(() => { if (token) flush(); }, 5000);
     }
     renderNotes(); renderEditor();
   });
@@ -570,6 +592,7 @@ let pendingDel = null, toastT = null;
 function commitDelete() {
   if (!pendingDel) return;
   const n = pendingDel; pendingDel = null; clearTimeout(toastT); $('#toast').hidden = true;
+  dropDraft(n);
   if (!n.id && !n.pending) return;
   queue(async () => {
     try { if (n.id) { await trash(n.id); cache.del(n.id); } }
@@ -578,7 +601,7 @@ function commitDelete() {
 }
 function removeNote(n) {
   commitDelete(); // an earlier delete still waiting on its undo goes through now
-  if (cur && cur.note === n) { clearTimeout(autoT); cur = null; document.body.classList.remove('editing'); }
+  if (cur && cur.note === n) { cur = null; document.body.classList.remove('editing'); }
   notes = notes.filter(x => x !== n);
   renderNotes(); renderEditor();
   pendingDel = n;
@@ -590,7 +613,7 @@ $('#toast-undo').onclick = () => {
   const n = pendingDel; if (!n) return;
   pendingDel = null; clearTimeout(toastT); $('#toast').hidden = true;
   notes = [...notes, n].sort((a, b) => (b.modifiedTime || '').localeCompare(a.modifiedTime || ''));
-  renderNotes();
+  renderNotes(); flush();
 };
 function moveNote(n, to) {
   const from = n.folder;
@@ -603,15 +626,16 @@ function moveNote(n, to) {
   });
 }
 $('#kind').onchange = e => { if (cur) moveNote(cur.note, e.target.value); };
-tEl.addEventListener('input', scheduleSave);
-bEl.addEventListener('input', scheduleSave);
+tEl.addEventListener('input', onType);
+bEl.addEventListener('input', onType);
 tEl.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); bEl.focus(); } });
 $('#q').addEventListener('input', renderNotes);
 $('#new').onclick = newNote;
 $('#fab').onclick = newNote;
-$('#back').onclick = () => { saveNote(); document.body.classList.remove('editing'); };
-document.addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); saveNote(); } });
-window.addEventListener('beforeunload', e => { saveNote(); commitDelete(); if (notes.some(n => n.pending)) e.preventDefault(); });
+$('#back').onclick = () => { flush(); document.body.classList.remove('editing'); };
+document.addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); flush(); } });
+// typed text is already on the device; this only asks to wait when Drive hasn't caught up yet
+window.addEventListener('beforeunload', e => { flush(); commitDelete(); if (notes.some(needsSync)) e.preventDefault(); });
 
 /* ---------- calendar ---------- */
 // one file per event: "YYYY-MM-DD[ HH:MM] 내용.md"
@@ -690,23 +714,25 @@ function showTab(name) {
 $$('[data-tab]').forEach(b => b.onclick = () => { location.hash = b.dataset.tab; });
 window.addEventListener('hashchange', () => showTab(location.hash.slice(1)));
 
-let syncing = false;
+let syncing = false, restored = false;
 async function syncAll() {
   if (!token || syncing) return;
-  saveNote(); commitDelete();
+  flush(); commitDelete();
   syncing = true; $('#refresh').disabled = true; $('#refresh').classList.add('spin'); status('');
   try {
     await chain; // let pending writes land before re-reading
     if (!NOTES) { const root = await folder(ROOT_NAME); NOTES = await folder('노트', root); CAL = await folder('캘린더', root); }
-    await loadNotes(); await loadCal();
+    await loadNotes();
+    if (!restored) { restored = true; restoreDrafts(); }
+    await loadCal();
   } catch (e) { fail(e); }
   syncing = false; $('#refresh').disabled = false; $('#refresh').classList.remove('spin');
 }
 $('#refresh').onclick = syncAll;
 // pick up changes made on the other device (or by Claude) when the app comes back to the front
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') { saveNote(); commitDelete(); } // phone switched apps: write now
-  else if (!dirty()) syncAll();
+  if (document.visibilityState === 'hidden') { flush(); commitDelete(); } // phone switched apps: write now
+  else if (!notes.some(needsSync)) syncAll();
 });
 
 renderCal();
