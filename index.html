@@ -638,11 +638,11 @@ document.addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.ke
 window.addEventListener('beforeunload', e => { flush(); commitDelete(); if (notes.some(needsSync)) e.preventDefault(); });
 
 /* ---------- calendar ---------- */
-// one file per event: "YYYY-MM-DD[ HH:MM] 내용.md"
+// one file per event: "YYYY-MM-DD[ HH:MM] 내용.md" ("HH MM" too: Windows/Drive-for-desktop can't write ':')
 let events = [], calLoaded = false;
 const view = new Date(); view.setDate(1);
 let sel = ymd(new Date());
-const parseEv = f => { const m = /^(\d{4}-\d{2}-\d{2})(?: (\d{2}:\d{2}))? (.+?)(?:\.md)?$/.exec(f.name); return m && { id: f.id, date: m[1], time: m[2] || '', text: m[3] }; };
+const parseEv = f => { const m = /^(\d{4}-\d{2}-\d{2})(?: (\d{2})[: ](\d{2}))? (.+?)(?:\.md)?$/.exec(f.name); return m && { id: f.id, date: m[1], time: m[2] ? m[2] + ':' + m[3] : '', text: m[4] }; };
 const byTime = (a, b) => a.time.localeCompare(b.time) || a.text.localeCompare(b.text);
 
 function renderCal() {
