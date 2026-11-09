@@ -320,18 +320,30 @@ function showApp() {
   $('#view-login').hidden = true; $('#tabs').hidden = false; $('#refresh').hidden = false;
   showTab(location.hash.slice(1));
 }
+// Google tokens last 1h and a static site can't hold a refresh token, so remember the account and
+// reconnect with prompt:'' (Google's popup closes by itself, no account picker).
+// ponytail: still a popup per hour; zero-tap needs a small server holding a refresh token.
+const getHint = () => { try { return localStorage.getItem('hint') || ''; } catch { return ''; } };
+let chooser = false; // a silent reconnect failed: show Google's account picker on the next tap
+function connect() {
+  const hint = getHint();
+  tokenClient.requestAccessToken(hint && !chooser ? { prompt: '', login_hint: hint } : { prompt: 'select_account' });
+}
 window.gisReady = () => {
   tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: CLIENT_ID, scope: SCOPE,
     callback: resp => {
-      if (resp.error) { status('로그인하지 못했어요: ' + resp.error, 'err'); return; }
+      if (resp.error) { chooser = true; status('한 번 더 눌러서 구글 계정을 골라 주세요.', 'warn'); return; }
       token = resp.access_token; saveToken(token, Number(resp.expires_in) || 3600);
       showApp(); syncAll();
+      if (!getHint()) api(`${API}/about?fields=user(emailAddress)`).then(r => r.json())
+        .then(j => localStorage.setItem('hint', j.user.emailAddress)).catch(() => {});
     },
   });
   $('#login').disabled = false;
+  if (getHint()) { $('#login').textContent = '다시 연결하기'; if (!token) connect(); } // browsers may block this untapped popup; the button stays as fallback
 };
-$('#login').onclick = () => tokenClient && tokenClient.requestAccessToken();
+$('#login').onclick = () => tokenClient && connect();
 
 /* ---------- drive ---------- */
 async function api(url, opts = {}) {
@@ -374,7 +386,7 @@ const updateFile = (id, name, text) => upload('PATCH', id, { name }, text);
 const moveFile = (id, from, to) => api(`${API}/files/${id}?addParents=${to}&removeParents=${from}&fields=id`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: '{}' });
 const trash = id => api(`${API}/files/${id}?fields=id`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: '{"trashed":true}' });
 const readText = async id => (await api(`${API}/files/${id}?alt=media`)).text();
-const fail = e => e instanceof AuthError ? needLogin('로그인 시간이 지났어요. 다시 로그인해 주세요.') : status(e.message, 'err');
+const fail = e => e instanceof AuthError ? needLogin('연결 시간이 지났어요. 다시 연결하기를 누르면 바로 이어져요.') : status(e.message, 'err');
 
 // two-step delete: first tap arms, second tap deletes
 function armDelete(btn, label, run) {
